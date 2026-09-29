@@ -25,6 +25,7 @@ helpsearch*/
 slprj/
 sccprj/
 codegen/
+research/
 
 # Cache files
 *.slxc
@@ -51,7 +52,9 @@ codegen/
 .claude/settings.local.json
 
 # Superseded intermediate versions (V1 and V6-V11 are kept)
-ImagePostProcessingDlgV2.mlapp
-ImagePostProcessingDlgV3.mlapp
-ImagePostProcessingDlgV4.mlapp
-ImagePostProcessingDlgV5.mlapp
+ImagePostProcessingDlgV02.mlapp
+ImagePostProcessingDlgV03.mlapp
+ImagePostProcessingDlgV04.mlapp
+ImagePostProcessingDlgV05.mlapp
+
+/dadOAO
