@@ -1,4 +1,4 @@
-classdef ImagePostProcessingDlgV8 < matlab.apps.AppBase
+classdef ImagePostProcessingDlgV09 < matlab.apps.AppBase
 
     % Properties that correspond to app components
     properties (Access = public)
@@ -135,6 +135,43 @@ classdef ImagePostProcessingDlgV8 < matlab.apps.AppBase
                                                  %(whether to optimize at all is controlled by the
                                                  %OptimizeGridCheckBox UI control, not a private property,
                                                  %matching the ApplyFFCheckBox/ApplyGCCheckBox convention)
+        grid_DetectionMethod = 1;               %V9: how each crossing's position is found.
+                                                 % 1 = local fit only (DEFAULT -- the original V1-V8
+                                                 %     behaviour: GridPositionOptimize seeded from the
+                                                 %     lattice model)
+                                                 % 2 = cross-correlation + local fit, AVERAGED
+                                                 %Method 2 is 21-28% more accurate than method 1 against
+                                                 %synthetic ground truth at every image-quality level, and
+                                                 %returns ~240 crossings per plane against the configured
+                                                 %100 -- the two estimators' errors are only weakly
+                                                 %correlated (+0.17..+0.35), so averaging them reduces error.
+                                                 %
+                                                 %Method 1 is the DEFAULT anyway, by the user's decision:
+                                                 %method 2 is ~1.13x SLOWER on the full routine because it
+                                                 %runs the same full local fit on every point that method 1
+                                                 %runs and then adds the correlation on top. It cannot be
+                                                 %made faster without dropping the both-estimators-agree
+                                                 %corroboration, and that corroboration is exactly what
+                                                 %fixes whole-cell column slips on degraded planes. Method 1
+                                                 %is also the better-proven path. Method 2 stays available
+                                                 %for stacks where its accuracy or its much denser crossing
+                                                 %set is worth the time.
+        grid_WidthRatio = [];                   %[ratioX ratioY] = grid-bar width / lattice period, of the
+                                                 %most recently TRUSTED measurement. Empty until first
+                                                 %calibrated. Kept as a scalar pair for settings
+                                                 %save/load compatibility.
+        grid_WidthRatioByPlane = [];            %Z x 2 per-plane trusted ratios (NaN where not measured),
+                                                 %so each plane can inherit from a properly-handled
+                                                 %NEIGHBOUR rather than everything descending from plane 1
+                                                 %and accumulating that one plane's error. A plane's own
+                                                 %measurement is accepted only if it is well-sampled AND
+                                                 %close to its nearest measured neighbour -- see
+                                                 %GridWidthRatioForPlane.
+        GridXCorrCache = [];                    %single-entry cache for GridDetectPlaneByCrossCorr: struct
+                                                 %with plane/d1/d2/theta1/peaks. Deliberately one entry only
+                                                 %(the caller walks planes in order and re-runs several
+                                                 %passes over the SAME plane, which is exactly the repeat
+                                                 %this needs to absorb) so it cannot grow unbounded.
         grid_PendingOriginConfirm = [];          %stashed (plane,latticeModel,anchorHandle,anchorPos)
                                                  %between ConfirmGridOriginAndRefine's setup and
                                                  %GridConfirmOriginClicked's finalize -- replaces the
@@ -901,10 +938,19 @@ classdef ImagePostProcessingDlgV8 < matlab.apps.AppBase
                 0
             ];
         
-            options = optimoptions( ...
-                "lsqcurvefit", ...
-                "Algorithm","trust-region-reflective", ...
-                "Display","off");
+            % Built ONCE and reused. optimoptions constructs and validates an
+            % options object every call, and GridFitting runs twice per grid
+            % point per pass -- hundreds of identical rebuilds per plane for
+            % an object that never varies. persistent, not a property, so
+            % this stays a pure local concern of the fitting routine.
+            persistent lsqOptions
+            if isempty(lsqOptions)
+                lsqOptions = optimoptions( ...
+                    "lsqcurvefit", ...
+                    "Algorithm","trust-region-reflective", ...
+                    "Display","off");
+            end
+            options = lsqOptions;
         
             try
                 [fitParameters,resnorm,~,exitflag] = ...
@@ -984,6 +1030,610 @@ classdef ImagePostProcessingDlgV8 < matlab.apps.AppBase
             [X, Y] = meshgrid(localAxis, localAxis);
             isBar = (abs(X) <= barWidthX/2) | (abs(Y) <= barWidthY/2);
             template = -double(isBar);
+        end
+
+        %% --- V9: whole-plane cross-correlation detection ------------------
+        %
+        % GridBuildCrossingTemplate above models a SINGLE crossing and is
+        % built axis-aligned, because its caller (GridPositionOptimize's
+        % template variant) rotates the local search patch into lattice axes
+        % first. The functions below instead correlate ONE template across
+        % the whole plane in a single pass, so there is no per-point rotation
+        % available and the template must be built already rotated -- and it
+        % spans several unit cells rather than one.
+
+        function template = GridBuildMeshTemplateWeighted(~, d1, d2, theta1Deg, theta2Deg, ratioX, ratioY, nTile)
+            % Weighted multi-cell ("periodic") mesh template.
+            %
+            % Two things matter here and both were established by
+            % measurement against synthetic ground truth:
+            %
+            % 1. Each unit cell is made LOCALLY ZERO-MEAN before the
+            %    envelope is applied -- w.*(duty - isBar), not -w.*isBar.
+            %    normxcorr2 subtracts the template's mean, so with a plain
+            %    -w.*isBar the faded outer region becomes a nonzero CONSTANT
+            %    that contributes noise instead of fading out, and the
+            %    envelope achieves nothing.
+            % 2. The Gaussian envelope makes the centre crossing dominate
+            %    while the outer cells only help the peak lock on. Without
+            %    it, a tiled template drags positions toward a rigid global
+            %    period and gets WORSE as the local period drifts; with it,
+            %    period sensitivity is largely absorbed (measured: median
+            %    error 0.139 -> 0.186 px across a 3px period error, versus
+            %    0.183 -> 0.288 unweighted).
+            th1 = deg2rad(theta1Deg);
+            th2 = deg2rad(theta2Deg);
+            u1 = [cos(th1) sin(th1)];
+            u2 = [cos(th2) sin(th2)];
+
+            halfWidth = round(nTile*min(d1,d2)/2);
+            localAxis = -halfWidth:halfWidth;
+            [TX, TY] = meshgrid(localAxis, localAxis);
+            s1 = TX*u1(1) + TY*u1(2);
+            s2 = TX*u2(1) + TY*u2(2);
+
+            % modular distance to the nearest bar centreline along each axis
+            m1 = abs(mod(s1 + d1/2, d1) - d1/2);
+            m2 = abs(mod(s2 + d2/2, d2) - d2/2);
+            isBar = double( (m1 <= ratioX*d1/2) | (m2 <= ratioY*d2/2) );
+
+            duty = 1 - (1-ratioX)*(1-ratioY);   % bar area fraction of one cell
+            sigma = max(d1,d2)*0.75;            % ~0.75 of a period
+            wgt = exp(-(s1.^2 + s2.^2)/(2*sigma^2));
+            template = wgt .* (duty - isBar);
+        end
+
+        function [d1, d2, theta1Deg, theta2Deg, ok] = GridLatticeGlobalParams(~, latticeModel)
+            % Period and orientation of a lattice model, whichever SHAPE it
+            % arrives in. This matters: not every model carries d1/theta1.
+            % GridLatticeFromCurrentPositions (what "Optimize This Plane"
+            % and the pre-V7 compatibility path build) carries only
+            % predictedPos + localSpacing, and GridLatticeFromSurface is
+            % the same. The original per-point code never noticed, because
+            % GridPredictPosition/GridLatticeLocalSpacing both handle either
+            % shape -- but a whole-plane template needs one global period
+            % and angle, so it has to be derived here.
+            d1 = NaN; d2 = NaN; theta1Deg = NaN; theta2Deg = NaN; ok = false;
+            if ~isstruct(latticeModel)
+                return;
+            end
+            if isfield(latticeModel,'d1') && isfield(latticeModel,'d2') ...
+                    && isfield(latticeModel,'theta1') && isfield(latticeModel,'theta2')
+                d1 = latticeModel.d1; d2 = latticeModel.d2;
+                theta1Deg = latticeModel.theta1; theta2Deg = latticeModel.theta2;
+            elseif isfield(latticeModel,'localSpacing') && numel(latticeModel.localSpacing) >= 2
+                v1 = latticeModel.localSpacing{1};
+                v2 = latticeModel.localSpacing{2};
+                n1 = hypot(v1(:,1), v1(:,2));
+                n2 = hypot(v2(:,1), v2(:,2));
+                n1 = n1(isfinite(n1) & n1 > 0);
+                n2 = n2(isfinite(n2) & n2 > 0);
+                if isempty(n1) || isempty(n2)
+                    return;
+                end
+                d1 = median(n1); d2 = median(n2);
+                % median of the ANGLES, not of the vectors -- averaging the
+                % vectors would shrink them wherever orientation varies
+                a1 = atan2(v1(:,2), v1(:,1)); a2 = atan2(v2(:,2), v2(:,1));
+                theta1Deg = rad2deg(median(a1(isfinite(a1))));
+                theta2Deg = rad2deg(median(a2(isfinite(a2))));
+            else
+                return;
+            end
+            if ~isfinite(d1) || ~isfinite(d2) || d1 <= 2 || d2 <= 2 ...
+                    || ~isfinite(theta1Deg) || ~isfinite(theta2Deg)
+                d1 = NaN; d2 = NaN; theta1Deg = NaN; theta2Deg = NaN;
+                return;
+            end
+            ok = true;
+        end
+
+        function [ratioX, ratioY] = GridWidthRatioForPlane(app, plane, latticeModel, d1, d2)
+            % Which bar-width/period ratio to use for THIS plane.
+            %
+            % The ratio is a property of the physical mask, but its APPARENT
+            % value drifts with defocus/blur through Z, so pinning every
+            % plane to plane 1's measurement accumulates that one plane's
+            % error. Each plane therefore gets its own value -- but it is
+            % HARVESTED for free from the points that plane already fitted
+            % (GridHarvestWidthRatio, called at the end of the population
+            % pass), not measured by a dedicated pass.
+            %
+            % This function only decides which already-known value to USE.
+            % There is a genuine chicken-and-egg here -- the ratio is needed
+            % to BUILD the template, before this plane's points exist -- and
+            % the answer is to inherit: from this plane's previous pass, or
+            % from the nearest neighbouring plane. The ratio drifts only a
+            % few percent per plane (measured 0.17->0.18 across the 2024
+            % stack), so a one-pass/one-plane lag is immaterial.
+            %
+            % A dedicated calibration runs ONCE per stack, only when nothing
+            % is known anywhere -- see the bootstrap at the end.
+            if isempty(app.grid_WidthRatioByPlane) || size(app.grid_WidthRatioByPlane,1) < app.grid_SizeZ
+                app.grid_WidthRatioByPlane = nan(app.grid_SizeZ, 2);
+            end
+            if plane >= 1 && plane <= app.grid_SizeZ && all(isfinite(app.grid_WidthRatioByPlane(plane,:)))
+                ratioX = app.grid_WidthRatioByPlane(plane,1);
+                ratioY = app.grid_WidthRatioByPlane(plane,2);
+                return;
+            end
+
+            % nearest already-measured plane, preferring an adjacent one
+            refRatio = [];
+            measured = find(all(isfinite(app.grid_WidthRatioByPlane),2));
+            if ~isempty(measured)
+                [~, iNear] = min(abs(measured - plane));
+                refRatio = app.grid_WidthRatioByPlane(measured(iNear),:);
+            elseif ~isempty(app.grid_WidthRatio)
+                refRatio = app.grid_WidthRatio;
+            end
+            if ~isempty(refRatio)
+                ratioX = refRatio(1); ratioY = refRatio(2);
+                return;
+            end
+
+            % Nothing known anywhere: bootstrap once for the whole stack.
+            [candX, candY, nSamp] = GridCalibrateWidthRatio(app, plane, latticeModel, d1, d2);
+            wellSampled = nSamp >= 12;
+            accept = wellSampled;
+            if accept && ~isempty(refRatio)
+                % A big jump from a neighbour means this plane's profiles are
+                % unreliable, not that the mask changed. The band is
+                % deliberately LOOSE (35%): the apparent bar width really
+                % does broaden with defocus through Z -- measured 0.257 ->
+                % 0.344 from plane 1 to 8 on the 2026 stack -- and since the
+                % harvest is interior-only it stays trustworthy even on a
+                % degraded plane. A tighter 20% band suppressed that genuine
+                % drift and made plane 7 markedly worse (edge error max 5.14
+                % vs 1.06 px). The guard is here to catch gross failure, not
+                % to pin the ratio.
+                drift = max(abs([candX candY] - refRatio) ./ refRatio);
+                accept = drift <= 0.35;
+                if ~accept
+                    GridLog(app, ['Plane %d: measured width ratio %.3f x %.3f rejected ' ...
+                        '(%.0f%% from the nearest measured plane) -- inheriting %.3f x %.3f'], ...
+                        plane, candX, candY, 100*drift, refRatio(1), refRatio(2));
+                end
+            elseif ~accept
+                GridLog(app, 'Plane %d: width ratio under-sampled (%d profiles) -- inheriting', plane, nSamp);
+            end
+
+            if accept
+                ratioX = candX; ratioY = candY;
+                app.grid_WidthRatioByPlane(plane,:) = [ratioX ratioY];
+                app.grid_WidthRatio = [ratioX ratioY];
+                GridLog(app, 'Plane %d: width/period ratio %.3f x %.3f (from %d profiles)', ...
+                    plane, ratioX, ratioY, nSamp);
+            elseif ~isempty(refRatio)
+                ratioX = refRatio(1); ratioY = refRatio(2);
+                % deliberately NOT written into grid_WidthRatioByPlane: an
+                % inherited value must never become a reference for the next
+                % plane, or a single bad plane would still propagate
+            else
+                ratioX = 0.25; ratioY = 0.25;   % typical open-mesh duty cycle
+                GridLog(app, 'Plane %d: no usable width ratio anywhere -- using the 0.25 default', plane);
+            end
+        end
+
+        function GridHarvestWidthRatio(app, plane, latticeModel, d1, d2)
+            % Measure this plane's bar-width/period ratio from the points it
+            % has ALREADY fitted, for the next pass/plane to use.
+            %
+            % Why this rather than a dedicated calibration pass: the points
+            % are already converged, so all that is needed is the marginalized
+            % profile at each accepted position. Profiling put GridProfile at
+            % ~1.4 ms against GridPositionOptimize's ~9.7 ms, so harvesting
+            % costs about a seventh of re-fitting -- and it is measured at the
+            % CONVERGED position instead of the predicted one, which is also
+            % the more correct place to measure it.
+            targetSamples = 40;
+            if plane < 1 || plane > app.grid_SizeZ
+                return;
+            end
+            nTotal = app.grid_SizeX*app.grid_SizeY;
+
+            % Interior, genuinely-measured points only: the outer ring is
+            % where a bar direction fades out on a degraded plane, and an
+            % untrusted point has no business defining the mask's geometry.
+            cand = [];
+            for grid_y = 1:app.grid_SizeY
+                for grid_x = 1:app.grid_SizeX
+                    if app.grid_SizeX > 2 && app.grid_SizeY > 2 && ...
+                            (grid_x==1 || grid_x==app.grid_SizeX || grid_y==1 || grid_y==app.grid_SizeY)
+                        continue;
+                    end
+                    index = (grid_y-1)*app.grid_SizeX + grid_x;
+                    if index > nTotal, continue; end
+                    if ~GridIsGenuineMeasurement(app, app.grid_Info{index, plane})
+                        continue;
+                    end
+                    cand(end+1,:) = [grid_x grid_y index]; %#ok<AGROW>
+                end
+            end
+            if size(cand,1) < 12
+                return;   % too few trustworthy points to redefine the ratio
+            end
+            % spread the samples over the plane rather than taking the top rows
+            stride = max(1, floor(size(cand,1)/targetSamples));
+            visitOrder = 1:stride:size(cand,1);
+
+            fwhmXList = []; fwhmYList = [];
+            for vi = visitOrder
+                grid_x = cand(vi,1); grid_y = cand(vi,2); index = cand(vi,3);
+                pos = app.grid_Position(index,:,plane);
+                [xdx, xdy] = GridLatticeLocalSpacing(app, latticeModel, grid_x, grid_y, 1);
+                [profileX, profileY, profileStatus] = GridProfile(app, pos, xdx, xdy);
+                if profileStatus ~= 1
+                    continue;
+                end
+                halfWidthProfile = (numel(profileX)-1)/2;
+                profileAxis = -halfWidthProfile:halfWidthProfile;
+                fx = GridProfileFWHM(app, profileX, profileAxis);
+                fy = GridProfileFWHM(app, profileY, profileAxis);
+                if isfinite(fx), fwhmXList(end+1) = fx; end %#ok<AGROW>
+                if isfinite(fy), fwhmYList(end+1) = fy; end %#ok<AGROW>
+            end
+
+            nSamp = min(numel(fwhmXList), numel(fwhmYList));
+            if nSamp < 12
+                return;
+            end
+            candX = min(max(median(fwhmXList)/d1, 0.05), 0.60);
+            candY = min(max(median(fwhmYList)/d2, 0.05), 0.60);
+
+            % Same drift guard as before: a big jump from a neighbour means
+            % this plane's profiles are unreliable, not that the mask changed.
+            refRatio = [];
+            measured = find(all(isfinite(app.grid_WidthRatioByPlane),2));
+            measured = measured(measured ~= plane);
+            if ~isempty(measured)
+                [~, iNear] = min(abs(measured - plane));
+                refRatio = app.grid_WidthRatioByPlane(measured(iNear),:);
+            end
+            if ~isempty(refRatio)
+                drift = max(abs([candX candY] - refRatio) ./ refRatio);
+                if drift > 0.35
+                    GridLog(app, ['Plane %d: harvested width ratio %.3f x %.3f rejected ' ...
+                        '(%.0f%% from the nearest measured plane) -- keeping %.3f x %.3f'], ...
+                        plane, candX, candY, 100*drift, refRatio(1), refRatio(2));
+                    return;
+                end
+            end
+            app.grid_WidthRatioByPlane(plane,:) = [candX candY];
+            app.grid_WidthRatio = [candX candY];
+            GridLog(app, 'Plane %d: width/period ratio %.3f x %.3f harvested from %d fitted points', ...
+                plane, candX, candY, nSamp);
+        end
+
+        function [ratioX, ratioY, nSamp] = GridCalibrateWidthRatio(app, plane, latticeModel, d1, d2) %#ok<INUSD>
+            % Measures bar width / lattice period on the CURRENT reference
+            % image by harvesting FWHM from the same marginalized profiles
+            % GridCompareFittingMethods uses. Returns the sample count so the
+            % caller can judge whether to trust it.
+            %
+            % Deliberately measured rather than self-calibrated from the
+            % correlation peak's sharpness: on synthetic data sharpness
+            % picked the correct width exactly, but on the REAL stack it
+            % picked ~0.80x while 1.00-1.20x actually agreed better with the
+            % converged positions (98/100 vs 96/100 within 2px). The
+            % sharpness curve is too flat on real data to trust.
+            %
+            % INTERIOR points only: the outer ring is exactly where a bar
+            % direction fades out on a degraded plane, so including it biases
+            % the measurement using the worst data on the plane.
+            %
+            % Stops as soon as enough samples are in hand. The result is a
+            % MEDIAN of a slowly-varying physical quantity, then drift-guarded
+            % by the caller, so a couple of dozen samples is as good as all 64
+            % -- and this ran a full extra local fit per interior point on
+            % EVERY plane, which profiling showed to be method 2's single
+            % largest overhead (0.80 s/plane, ~6.4 s across an 8-plane stack,
+            % bigger than the correlation itself at ~0.28 s/plane).
+            targetSamples = 40;
+            % Candidate interior points, visited in an evenly SPREAD order.
+            % Row-major order would sample only the top of the grid before
+            % hitting the target -- which on a stack whose top rows fade out
+            % is precisely the worst data on the plane.
+            cand = [];
+            for grid_y=1:app.grid_SizeY
+                for grid_x=1:app.grid_SizeX
+                    if app.grid_SizeX > 2 && app.grid_SizeY > 2 && ...
+                            (grid_x==1 || grid_x==app.grid_SizeX || grid_y==1 || grid_y==app.grid_SizeY)
+                        continue;
+                    end
+                    cand(end+1,:) = [grid_x grid_y]; %#ok<AGROW>
+                end
+            end
+            if isempty(cand)
+                ratioX = 0.25; ratioY = 0.25; nSamp = 0;
+                return;
+            end
+            stride = max(1, floor(size(cand,1)/max(targetSamples,1)));
+            visitOrder = [1:stride:size(cand,1), setdiff(1:size(cand,1), 1:stride:size(cand,1))];
+
+            fwhmXList = []; fwhmYList = [];
+            for vi = visitOrder
+                    grid_x = cand(vi,1); grid_y = cand(vi,2);
+                    estimatedPos = GridPredictPosition(app, latticeModel, grid_x, grid_y);
+                    [xdx, xdy] = GridLatticeLocalSpacing(app, latticeModel, grid_x, grid_y, 1);
+                    [~, fitStatus, ~] = GridPositionOptimize(app, estimatedPos, xdx, xdy);
+                    if fitStatus ~= 1
+                        continue;
+                    end
+                    [profileX, profileY, profileStatus] = GridProfile(app, estimatedPos, xdx, xdy);
+                    if profileStatus ~= 1
+                        continue;
+                    end
+                    halfWidthProfile = (numel(profileX)-1)/2;
+                    profileAxis = -halfWidthProfile:halfWidthProfile;
+                    fx = GridProfileFWHM(app, profileX, profileAxis);
+                    fy = GridProfileFWHM(app, profileY, profileAxis);
+                    if isfinite(fx), fwhmXList(end+1) = fx; end %#ok<AGROW>
+                    if isfinite(fy), fwhmYList(end+1) = fy; end %#ok<AGROW>
+                    if min(numel(fwhmXList), numel(fwhmYList)) >= targetSamples
+                        break;
+                    end
+            end
+            nSamp = min(numel(fwhmXList), numel(fwhmYList));
+            if isempty(fwhmXList) || isempty(fwhmYList)
+                ratioX = 0.25; ratioY = 0.25;  % typical open-mesh duty cycle
+            else
+                ratioX = median(fwhmXList) / d1;
+                ratioY = median(fwhmYList) / d2;
+            end
+            % keep it physically plausible even if the harvest went wrong
+            ratioX = min(max(ratioX, 0.05), 0.60);
+            ratioY = min(max(ratioY, 0.05), 0.60);
+        end
+
+        function [d1Out, d2Out, usedImage] = GridCrossCheckPeriod(app, plane, d1In, d2In)
+            % Cross-checks the lattice model's period against the image's own
+            % autocorrelation, and accepts the image estimate ONLY if the two
+            % already roughly agree.
+            %
+            % The guard is the whole point. On a badly degraded plane the
+            % autocorrelation's strongest off-centre peak is not reliably the
+            % first lattice ring, so an unguarded image estimate can hand back
+            % a confidently wrong periodicity. Requiring agreement with the
+            % model (which comes from the Z-trend across planes, i.e. from
+            % planes that WERE handled well) means the image can refine the
+            % period but never overrule it.
+            %
+            % Two traps, both hit for real while developing this:
+            %   - never take a median over the top-N peak radii: it mixes the
+            %     first ring with the diagonal ring at d*sqrt(2) and with
+            %     spurious short-radius peaks (that produced 26.5px against a
+            %     true 38.9px). Take the strongest peak, then its roughly
+            %     perpendicular partner.
+            %   - hann() needs Signal Processing Toolbox, which is not
+            %     necessarily installed. The window is inlined below.
+            d1Out = d1In; d2Out = d2In; usedImage = false;
+            img = app.ref_Image;
+            if isempty(img) || ~ismatrix(img)
+                return;
+            end
+            % work on a crop well inside the illuminated field: the whole
+            % frame's autocorrelation is dominated by the bright disc's own
+            % envelope rather than by the mesh
+            S = imgaussfilt(double(img), 15);
+            mask = S > 0.45*max(S(:));
+            mask = imopen(mask, strel('disk', 9));
+            st = regionprops(mask, 'BoundingBox', 'Area');
+            if isempty(st)
+                return;
+            end
+            [~, iBig] = max([st.Area]);
+            bb = st(iBig).BoundingBox;
+            cx = bb(1)+bb(3)/2; cy = bb(2)+bb(4)/2;
+            half = floor(0.62*min(bb(3), bb(4))/2);
+            if half < 3*max(d1In,d2In)   % fewer than ~3 periods -> not worth trusting
+                return;
+            end
+            r0 = max(1, round(cy-half)); r1 = min(size(img,1), round(cy+half));
+            c0 = max(1, round(cx-half)); c1 = min(size(img,2), round(cx+half));
+            A = double(img(r0:r1, c0:c1));
+            A = A - mean(A(:));
+            h1 = 0.5*(1-cos(2*pi*(0:size(A,1)-1)'/(size(A,1)-1)));
+            h2 = 0.5*(1-cos(2*pi*(0:size(A,2)-1)'/(size(A,2)-1)));
+            A = A .* (h1*h2');
+            F = fft2(A);
+            R = fftshift(real(ifft2(F.*conj(F))));
+            if ~all(isfinite(R(:))) || max(R(:)) <= 0
+                return;
+            end
+            R = R/max(R(:));
+            ctr = (size(R)+1)/2;
+            [XX, YY] = meshgrid(1:size(R,2), 1:size(R,1));
+            rad = hypot(XX-ctr(2), YY-ctr(1));
+            % search a band around the expected period only -- another way the
+            % estimate is kept from wandering onto the wrong ring
+            lo = 0.6*min(d1In,d2In); hi = 1.6*max(d1In,d2In);
+            Rm = R; Rm(~(rad > lo & rad < hi)) = -inf;
+            D = imdilate(Rm, strel('disk', 4));
+            [pkR, pkC] = find((Rm == D) & isfinite(Rm));
+            if numel(pkR) < 2
+                return;
+            end
+            pv = Rm(sub2ind(size(Rm), pkR, pkC));
+            [~, ord] = sort(pv, 'descend');
+            pkR = pkR(ord); pkC = pkC(ord);
+            vx = pkC-ctr(2); vy = pkR-ctr(1);
+            a1 = atan2(vy(1), vx(1));
+            dImg1 = hypot(vx(1), vy(1));
+            dImg2 = dImg1;
+            for k = 2:numel(vx)
+                ak = atan2(vy(k), vx(k));
+                if abs(abs(mod(ak-a1+pi/2, pi) - pi/2)) < deg2rad(25)
+                    dImg2 = hypot(vx(k), vy(k));
+                    break;
+                end
+            end
+            % The image estimate VALIDATES the model rather than replacing
+            % it. Two reasons: the autocorrelation's peak ring is found on a
+            % discrete grid and comes back effectively isotropic, so adopting
+            % it would throw away the genuine d1 != d2 anisotropy the model
+            % carries (e.g. 29.90/30.74 collapsing to 31.02/31.02); and on a
+            % degraded plane the image estimate is the less trustworthy of
+            % the two. A disagreement is reported rather than acted on -- it
+            % means that plane's lattice model is suspect and its detection
+            % should be treated with suspicion.
+            drift = max(abs([dImg1 dImg2] - [d1In d2In]) ./ [d1In d2In]);
+            usedImage = drift <= 0.15;
+            if usedImage
+                GridLog(app, 'Plane %d: period cross-check OK (image %.2f/%.2f vs model %.2f/%.2f, %.0f%%)', ...
+                    plane, dImg1, dImg2, d1In, d2In, 100*drift);
+            else
+                GridLog(app, ['Plane %d: WARNING -- image period estimate %.2f/%.2f disagrees with the ' ...
+                    'lattice model %.2f/%.2f by %.0f%%. Keeping the model, but this plane''s periodicity ' ...
+                    'is suspect; check its grid points.'], ...
+                    plane, dImg1, dImg2, d1In, d2In, 100*drift);
+            end
+        end
+
+        function [peaks, ridgePeaks] = GridDetectPlaneByCrossCorr(app, plane, latticeModel, d1, d2, theta1Deg, theta2Deg)
+            % ONE normxcorr2 of the weighted mesh template across the whole
+            % current reference image -> every grid crossing in the
+            % illuminated field appears as an isolated peak. Returns an
+            % N x 2 [X Y] list of sub-pixel peak positions, or [] if the
+            % correlation could not be run.
+            peaks = []; ridgePeaks = [];
+            if isempty(app.ref_Image) || ~ismatrix(app.ref_Image) || any(size(app.ref_Image) < 32)
+                return;
+            end
+
+            % Single-entry cache: GridOptimizePlaneUntilConverged calls this
+            % once per pass over the SAME plane, and the correlation does not
+            % depend on the seed at all -- only on the template, which barely
+            % moves between passes. Recompute only on a plane change or a
+            % genuine lattice change.
+            c = app.GridXCorrCache;
+            if ~isempty(c) && c.plane == plane ...
+                    && abs(c.d1 - d1) < 0.02*d1 ...
+                    && abs(c.d2 - d2) < 0.02*d2 ...
+                    && abs(c.theta1 - theta1Deg) < 0.5
+                peaks = c.peaks; ridgePeaks = c.ridgePeaks;
+                return;
+            end
+
+            % sanity-check the model's period against the image itself; this
+            % only warns, it does not override (see GridCrossCheckPeriod)
+            GridCrossCheckPeriod(app, plane, d1, d2);
+            [ratioX, ratioY] = GridWidthRatioForPlane(app, plane, latticeModel, d1, d2);
+            template = GridBuildMeshTemplateWeighted(app, d1, d2, ...
+                theta1Deg, theta2Deg, ratioX, ratioY, 3);
+            halfWidth = (size(template,1)-1)/2;
+
+            img = double(app.ref_Image);
+            [H, W] = size(img);
+            if H < 2*halfWidth+8 || W < 2*halfWidth+8
+                return;
+            end
+
+            C = normxcorr2(template, img);
+            % Crop back to image coordinates: imageRow = peakRow - halfWidth
+            % for a (2*halfWidth+1) template (verified, not assumed).
+            Cimg = C(halfWidth+1 : halfWidth+H, halfWidth+1 : halfWidth+W);
+
+            nmsRadius = max(3, round(0.6*min(d1, d2)));
+            D = imdilate(Cimg, strel('disk', nmsRadius));
+            valid = false(H,W);
+            valid(halfWidth+3 : H-halfWidth-3, halfWidth+3 : W-halfWidth-3) = true;
+            if ~any(valid(:))
+                return;
+            end
+            % Threshold RELATIVE to this heat map's own maximum. An absolute
+            % cut is wrong: a weighted template is attenuated and sits on a
+            % lower correlation scale than a flat one, and the right value
+            % also differs between synthetic and real data (0.55 works on
+            % synthetic; on the real stack it silently loses 20-30% of the
+            % crossings and 0.20 is correct).
+            peakThreshold = 0.20 * max(Cimg(valid));
+            isPeak = (Cimg == D) & (Cimg > peakThreshold) & valid;
+            [pr, pc] = find(isPeak);
+            if isempty(pr)
+                return;
+            end
+
+            [peaks, isPeak2D] = GridSubPixelQuad5(app, Cimg, pr, pc);
+            % Drop ridge responses here rather than per grid point, so a
+            % ridge can't be claimed by a NEIGHBOURING crossing either. A
+            % dropped peak leaves that crossing to the local fit alone, and
+            % if the local fit also fails the point ends up fitOK=false and
+            % excluded from the surface fit -- which is exactly the
+            % protective behaviour the original method had.
+            nRejected = nnz(~isPeak2D);
+            ridgePeaks = peaks(~isPeak2D,:);
+            peaks = peaks(isPeak2D,:);
+            app.GridXCorrCache = struct('plane', plane, 'd1', d1, ...
+                'd2', d2, 'theta1', theta1Deg, 'peaks', peaks, 'ridgePeaks', ridgePeaks);
+            GridLog(app, 'Plane %d: cross-correlation found %d crossings (%d ridge responses rejected)', ...
+                plane, size(peaks,1), nRejected);
+        end
+
+        function [pts, isPeak2D] = GridSubPixelQuad5(~, Cimg, pr, pc)
+            % Sub-pixel peak location by a least-squares 2D quadratic fitted
+            % over the 5x5 neighbourhood, NOT the usual 3-point parabola.
+            % The correlation peak of a binary mesh template is not
+            % parabolic, so the 3-point form is biased; measured against
+            % synthetic ground truth the 5x5 least-squares fit is 27-33%
+            % more accurate on degraded planes and equal on sharp ones.
+            % isPeak2D additionally reports whether the response is genuinely
+            % localized in BOTH directions, i.e. a peak rather than a RIDGE.
+            % This matters wherever one bar direction has faded out (the
+            % illuminated field's edge on a degraded plane): the correlation
+            % then runs as a continuous ridge along the surviving bar, the
+            % position ALONG that ridge is unconstrained, and the response is
+            % still TALL -- so no threshold on peak height can catch it.
+            % Measured on the 2024 stack's plane 8: failing points had peak
+            % value 0.350 vs 0.507 for good ones (overlapping, both far above
+            % the 0.124 threshold), but curvature anisotropy 0.106 vs 0.783.
+            % This is the classic corner-vs-edge (Harris/Shi-Tomasi) test,
+            % applied to the Hessian of the quadratic already being fitted.
+            ridgeAnisotropyMin = 0.40;   % catches 9/9 and 4/5 of the observed
+                                          % failures at a cost of ~3 good points
+                                          % per plane, which simply fall back to
+                                          % the local fit rather than being lost
+            n = numel(pr);
+            pts = zeros(n,2);
+            isPeak2D = false(n,1);
+            [qx, qy] = meshgrid(-2:2, -2:2);
+            A = [qx(:).^2, qy(:).^2, qx(:).*qy(:), qx(:), qy(:), ones(25,1)];
+            for k = 1:n
+                r = pr(k); c = pc(k);
+                % 3-point parabola kept as the fallback whenever the
+                % quadratic is degenerate or throws the peak out of its cell
+                d2r = Cimg(r-1,c) - 2*Cimg(r,c) + Cimg(r+1,c);
+                d2c = Cimg(r,c-1) - 2*Cimg(r,c) + Cimg(r,c+1);
+                dR = 0.5*(Cimg(r-1,c) - Cimg(r+1,c)) / d2r;
+                dC = 0.5*(Cimg(r,c-1) - Cimg(r,c+1)) / d2c;
+                if ~isfinite(dR), dR = 0; end
+                if ~isfinite(dC), dC = 0; end
+
+                patch = Cimg(r-2:r+2, c-2:c+2);
+                b = A \ patch(:);
+                Hm = [2*b(1), b(3); b(3), 2*b(2)];
+                useQuad = false;
+                if abs(det(Hm)) > 1e-12
+                    v = -Hm \ [b(4); b(5)];
+                    if all(isfinite(v)) && all(abs(v) < 2)
+                        pts(k,:) = [c + v(1), r + v(2)];
+                        useQuad = true;
+                    end
+                end
+                if ~useQuad
+                    pts(k,:) = [c + dC, r + dR];
+                end
+
+                % ridge test: a true maximum curves DOWN along both principal
+                % directions, and comparably so. A ridge has one eigenvalue
+                % near zero -- note det(Hm)>1e-12 above does not exclude that.
+                ev = eig(Hm);
+                if all(isfinite(ev)) && all(ev < 0)
+                    strongCurv = max(abs(ev));
+                    weakCurv   = min(abs(ev));
+                    isPeak2D(k) = strongCurv > 0 && (weakCurv/strongCurv) >= ridgeAnisotropyMin;
+                end
+            end
         end
 
         function fwhm = GridProfileFWHM(~, profile, localAxis)
@@ -1927,6 +2577,17 @@ classdef ImagePostProcessingDlgV8 < matlab.apps.AppBase
             %3 - all planes are done, ready for full correction
             app.grid_SettingStatus=status;
 
+            % V9: back to blank means a different image or a fresh start, so
+            % the cached correlation peaks and the harvested width/period
+            % ratio both belong to something that no longer applies. Cleared
+            % here rather than in each caller, since ResetSettingsButtonPushed
+            % and ChangeRefImageButtonPushed both funnel through this.
+            if status==0
+                app.GridXCorrCache = [];
+                app.grid_WidthRatio = [];
+                app.grid_WidthRatioByPlane = [];
+            end
+
             % These four used to be a long list of per-uicontrol Enable=
             % toggles repeated in every case below; now they're pushed to
             % the HTML view model(s) instead (see BuildViewModel/
@@ -2537,34 +3198,292 @@ classdef ImagePostProcessingDlgV8 < matlab.apps.AppBase
             end
         end
 
-        function GridPopulatePlaneAuto(app, plane, latticeModel)
+        function GridPopulatePlaneAuto(app, plane, latticeModel, onlyIndices)
             % Populate every grid crossing on the given plane from the
             % supplied global lattice model, refining each point
             % INDEPENDENTLY (no neighbor-to-neighbor propagation) via the
             % existing GridPositionOptimize/GridProfile/GridFitting local
             % Gaussian-dip fit.
+            %
+            % V9: this is the single choke point every detection path goes
+            % through, so grid_DetectionMethod is applied here and nowhere
+            % else. Method 1 is the original behaviour, unchanged. Method 2
+            % additionally runs ONE whole-plane cross-correlation and
+            % AVERAGES its answer with the local fit's -- see
+            % GridDetectPlaneByCrossCorr and the grid_DetectionMethod
+            % property comment for why averaging, rather than merely
+            % seeding, is what buys the accuracy.
+            if nargin < 4
+                onlyIndices = [];   % [] = every point
+            end
+            xcPeaks = []; ridgePeaks = [];
+            matchRadius = Inf;
+            gd1 = NaN; gd2 = NaN;   % only meaningful once paramsOK below
+            if app.grid_DetectionMethod == 2
+                [gd1, gd2, gth1, gth2, paramsOK] = GridLatticeGlobalParams(app, latticeModel);
+                if paramsOK
+                    [xcPeaks, ridgePeaks] = GridDetectPlaneByCrossCorr(app, plane, latticeModel, gd1, gd2, gth1, gth2);
+                    matchRadius = 0.5*min(gd1, gd2);
+                else
+                    % No usable global period/orientation for this model --
+                    % fall back to the original local-fit-only behaviour for
+                    % this call rather than failing.
+                    GridLog(app, 'Plane %d: no global lattice parameters available, using local fit only', plane);
+                end
+            end
+
+            % --- whole-plane cell-slip guard (Z continuity) ----------------
+            % The correlation knows every crossing in the field but nothing
+            % about WHICH crossing belongs to which grid index. If the seed
+            % lattice is a whole cell out of phase -- which happens: a weak
+            % plane's phase estimate can lock onto the neighbouring grid line
+            % (see GridProjectedPhase's header) -- then every prediction lands
+            % exactly on the WRONG crossing, the nearest peak sits right on
+            % top of it, and all 100 points snap one column over together.
+            % Measured on the 2024 stack seeding plane 7 from plane 6: 92 of
+            % 92 matched points slipped, median offset 29.8px against a 29px
+            % period.
+            %
+            % That failure is invisible to every check downstream: the
+            % shifted set is a perfectly self-consistent lattice, so the
+            % surface fit is happy and the residual is small. It is NOT
+            % detectable by comparing peaks against the prediction either --
+            % the match distance is ~0 precisely because the prediction is on
+            % a real crossing.
+            %
+            % The one thing that does see it is Z continuity, which is what
+            % method 1 leans on. Plane-to-plane motion is a few px (measured
+            % 3.9-7.0px median on this data); a cell slip is a whole period.
+            % So: populate, then check this plane against the previous one,
+            % and if it has jumped a cell, throw the correlation away and redo
+            % the plane with the local fit alone.
+            slipCheckPlane = plane - 1;
+            canSlipCheck = ~isempty(xcPeaks) && slipCheckPlane >= 1 && ...
+                size(app.grid_Position,3) >= slipCheckPlane && ...
+                any(app.grid_Position(:,1,slipCheckPlane) ~= 0);
+
+            GridPopulatePlaneAutoPass(app, plane, latticeModel, xcPeaks, ridgePeaks, matchRadius, onlyIndices);
+
+            if canSlipCheck
+                nTotal = app.grid_SizeX*app.grid_SizeY;
+                stepZ = hypot(app.grid_Position(1:nTotal,1,plane) - app.grid_Position(1:nTotal,1,slipCheckPlane), ...
+                              app.grid_Position(1:nTotal,2,plane) - app.grid_Position(1:nTotal,2,slipCheckPlane));
+                medStep = median(stepZ);
+                slipLimit = 0.5*min(gd1, gd2);
+                if medStep > slipLimit
+                    GridLog(app, ['Plane %d: WARNING -- positions jumped %.1fpx from plane %d ' ...
+                        '(limit %.1fpx, about half a period). The cross-correlation has latched onto ' ...
+                        'the wrong crossings -- a whole-cell slip. Discarding it and re-running this ' ...
+                        'plane with the local fit only.'], plane, medStep, slipCheckPlane, slipLimit);
+                    GridPopulatePlaneAutoPass(app, plane, latticeModel, [], [], Inf);
+                else
+                    % --- PER-POINT slip, which the plane-wide median cannot
+                    % see. Individual crossings latch onto a neighbour while
+                    % the rest of the plane is fine: measured on the 2024
+                    % stack, planes 4/5/6 had 1/3/7 points jump a full cell
+                    % with the plane median sitting at 0.22px. Every one of
+                    % them was being marked fitOK=true and fed to the surface
+                    % fit as a trusted point -- which is what shifts a column.
+                    %
+                    % Z motion is smooth and near-uniform across a plane, so a
+                    % point moving much further than its peers between planes
+                    % has changed crossing, not moved. Those points are redone
+                    % with the correlation withheld, which puts them back
+                    % under the local fit's authority -- and lets them fail
+                    % honestly (fitOK=false) so the surface fit excludes them,
+                    % exactly as method 1 would.
+                    perPointLimit = medStep + 0.5*min(gd1, gd2);
+                    slipped = find(stepZ > perPointLimit);
+                    if ~isempty(slipped)
+                        GridLog(app, ['Plane %d: %d point(s) moved more than %.1fpx from plane %d ' ...
+                            '(plane median %.1fpx) -- treating as wrong-crossing matches and redoing ' ...
+                            'them with the local fit only.'], ...
+                            plane, numel(slipped), perPointLimit, slipCheckPlane, medStep);
+                        GridPopulatePlaneAutoPass(app, plane, latticeModel, [], [], Inf, slipped);
+                    else
+                        GridLog(app, 'Plane %d: Z continuity OK (%.1fpx from plane %d)', plane, medStep, slipCheckPlane);
+                    end
+                end
+            end
+
+            GridPropagateUntrustedFromPreviousPlane(app, plane, slipCheckPlane);
+
+            % Re-measure the width/period ratio from the points this plane
+            % just fitted, for the next pass/plane. Free compared with a
+            % dedicated calibration pass (profile-only, no re-fitting) and
+            % measured at the converged positions.
+            if app.grid_DetectionMethod == 2 && isfinite(gd1) && isfinite(gd2)
+                GridHarvestWidthRatio(app, plane, latticeModel, gd1, gd2);
+            end
+        end
+
+        function GridPropagateUntrustedFromPreviousPlane(app, plane, prevPlane)
+            % Carry every UNTRUSTED point over from the previous plane rather
+            % than leaving it at a raw lattice prediction.
+            %
+            % Rationale (the user's, and it is the right one): the
+            % correlation exists to find most crossings quickly and form a
+            % TRUSTABLE network; the points it cannot vouch for should not be
+            % guessed at from a lattice model that may itself be out of phase
+            % -- they should inherit Z continuity from a plane that was
+            % handled well, and let the global refinement repair them. That is
+            % what method 1 does well and what the template must not override.
+            %
+            % The shift is measured from THIS plane's own trusted points, so
+            % it follows the real plane-to-plane motion instead of assuming
+            % the grid is static in Z.
+            if prevPlane < 1 || size(app.grid_Position,3) < prevPlane
+                return;
+            end
+            nTotal = app.grid_SizeX*app.grid_SizeY;
+            trusted = false(nTotal,1);
+            for index = 1:nTotal
+                info = app.grid_Info{index, plane};
+                trusted(index) = isstruct(info) && isfield(info,'fitOK') && info.fitOK;
+            end
+            if ~any(trusted) || all(trusted)
+                return;
+            end
+            prevPos = app.grid_Position(1:nTotal,:,prevPlane);
+            if ~any(prevPos(:,1) ~= 0)
+                return;   % previous plane never populated
+            end
+            curPos = app.grid_Position(1:nTotal,:,plane);
+            shift = median(curPos(trusted,:) - prevPos(trusted,:), 1);
+
+            nMoved = 0;
+            for index = find(~trusted)'
+                propagated = prevPos(index,:) + shift;
+                % Preserve WHY it was untrusted before overwriting source: a
+                % 'degenerate' point failed for a structural reason (one bar
+                % direction is simply not in the image), so re-running the
+                % plane cannot recover it. GridOptimizePlaneUntilConverged
+                % uses this to avoid burning a whole extra pass discovering
+                % that nothing improved.
+                priorSource = app.grid_Info{index, plane}.source;
+                app.grid_Info{index, plane}.structural = strcmp(priorSource, 'degenerate');
+                app.grid_Position(index,:,plane) = propagated;
+                app.grid_Info{index, plane}.rawPos = propagated;
+                app.grid_Info{index, plane}.source = 'propagated';
+                nMoved = nMoved + 1;
+            end
+            GridLog(app, ['Plane %d: %d untrusted point(s) propagated from plane %d ' ...
+                '(shift %.2f, %.2f px) -- left fitOK=false for the surface fit to repair.'], ...
+                plane, nMoved, prevPlane, shift(1), shift(2));
+        end
+
+        function GridPopulatePlaneAutoPass(app, plane, latticeModel, xcPeaks, ridgePeaks, matchRadius, onlyIndices)
+            % One population pass over the plane. Split out of
+            % GridPopulatePlaneAuto so the same loop can be re-run with the
+            % correlation peaks withheld when a slip guard rejects them --
+            % either for the whole plane, or (onlyIndices) for just the
+            % individual points that slipped.
+            if nargin < 7
+                onlyIndices = [];
+            end
             for grid_y=1:app.grid_SizeY
                 for grid_x=1:app.grid_SizeX
                     index=(grid_y-1)*app.grid_SizeX+grid_x;
+                    if ~isempty(onlyIndices) && ~any(onlyIndices == index)
+                        continue;
+                    end
 
                     estimatedPos = GridPredictPosition(app, latticeModel, grid_x, grid_y);
                     [xdx, xdy] = GridLatticeLocalSpacing(app, latticeModel, grid_x, grid_y, 1);
 
-                    [newPos, fitStatus, fitQuality] = GridPositionOptimize(app, estimatedPos, xdx, xdy);
-
-                    if fitStatus == 1
-                        app.grid_Info{index, plane}.rawPos = newPos;
-                        app.grid_Info{index, plane}.fitOK = true;
-                    else
-                        app.grid_Info{index, plane}.rawPos = estimatedPos;
-                        app.grid_Info{index, plane}.fitOK = false;
-                        newPos = estimatedPos;
+                    % whichever crossing the correlation put nearest the
+                    % predicted position, if one is close enough to be the
+                    % SAME crossing rather than a neighbour
+                    xcPos = [];
+                    if ~isempty(xcPeaks)
+                        [dMin, jMin] = min( (xcPeaks(:,1)-estimatedPos(1)).^2 ...
+                                          + (xcPeaks(:,2)-estimatedPos(2)).^2 );
+                        if sqrt(dMin) < matchRadius
+                            xcPos = xcPeaks(jMin,:);
+                        end
                     end
-                    app.grid_Info{index, plane}.fitRMSE = fitQuality;
-                    app.grid_Info{index, plane}.source = 'lattice';
-                    app.grid_Info{index, plane}.status = double(fitStatus==1);
 
-                    app.grid_Position(index,:,plane) = newPos;
+                    % Was there a REJECTED (ridge) response here? That is a
+                    % direct measurement that this neighbourhood carries only
+                    % one bar direction, so nothing measured here -- by either
+                    % estimator -- is trustworthy along the missing axis.
+                    % Previously these rejections were simply discarded; they
+                    % are the most useful evidence the correlation produces
+                    % about WHERE not to trust itself.
+                    nearRidge = false;
+                    if ~isempty(ridgePeaks)
+                        dR = min( (ridgePeaks(:,1)-estimatedPos(1)).^2 ...
+                                + (ridgePeaks(:,2)-estimatedPos(2)).^2 );
+                        nearRidge = sqrt(dR) < matchRadius;
+                    end
+
+                    % Seed the local fit from the correlation peak when there
+                    % is one: it sits far closer than the lattice prediction,
+                    % so the fit converges in a single pass instead of
+                    % needing several reseeded ones.
+                    if isempty(xcPos)
+                        seedPos = estimatedPos;
+                    else
+                        seedPos = xcPos;
+                    end
+                    [newPos, fitStatus, fitQuality] = GridPositionOptimize(app, seedPos, xdx, xdy);
+
+                    % The correlation's job is to find MOST crossings fast and
+                    % build a trustable network -- not to have an opinion
+                    % everywhere. A point is only trusted when BOTH estimators
+                    % independently agree there is a crossing here. Everything
+                    % else is handed to the global refinement as untrusted,
+                    % which is what method 1 is good at repairing.
+                    if fitStatus == 1 && ~isempty(xcPos) && ~nearRidge
+                        % both estimators succeeded -- average them; their
+                        % errors are only weakly correlated, so the mean
+                        % beats either one alone
+                        finalPos = (newPos + xcPos)/2;
+                        srcLabel = 'xcorr+fit';
+                        goodFit = true;
+                    elseif fitStatus == 1 && ~isempty(xcPos) && nearRidge
+                        % the correlation response here is one-directional, so
+                        % the peak is only constrained across the bar, not
+                        % along it. Keep the average (it is still the best
+                        % estimate available) but do NOT certify it.
+                        finalPos = (newPos + xcPos)/2;
+                        srcLabel = 'degenerate';
+                        goodFit = false;
+                    elseif fitStatus == 1 && ~nearRidge
+                        finalPos = newPos;
+                        srcLabel = 'lattice';
+                        goodFit = true;
+                    elseif fitStatus == 1
+                        % Local fit succeeded, but the correlation saw only a
+                        % ridge here -- one bar direction has faded out. The
+                        % local fit slides along that same direction for the
+                        % same reason (measured: points with source 'lattice'
+                        % drifting a full cell on the fading top row), so its
+                        % success is not evidence.
+                        finalPos = newPos;
+                        srcLabel = 'degenerate';
+                        goodFit = false;
+                    elseif ~isempty(xcPos)
+                        % The correlation found a crossing but the local fit
+                        % would not confirm it. Keep the position, withhold
+                        % trust: an uncorroborated template match is exactly
+                        % what let wrong-crossing matches into the surface fit.
+                        finalPos = xcPos;
+                        srcLabel = 'xcorr-unverified';
+                        goodFit = false;
+                    else
+                        finalPos = estimatedPos;
+                        srcLabel = 'lattice';
+                        goodFit = false;
+                    end
+
+                    app.grid_Info{index, plane}.rawPos = finalPos;
+                    app.grid_Info{index, plane}.fitOK = goodFit;
+                    app.grid_Info{index, plane}.fitRMSE = fitQuality;
+                    app.grid_Info{index, plane}.source = srcLabel;
+                    app.grid_Info{index, plane}.status = double(goodFit);
+
+                    app.grid_Position(index,:,plane) = finalPos;
                 end
             end
         end
@@ -2855,6 +3774,54 @@ classdef ImagePostProcessingDlgV8 < matlab.apps.AppBase
                      'Consider visually re-checking this plane.'], ...
                     plane, plane-1, spacingChange1*100, spacingChange2*100, angleChange1, angleChange2);
             end
+        end
+
+        function GridReportRoutineTime(app, routineName, elapsedSeconds, wasCancelled)
+            % Total wall-clock for a long user-initiated routine.
+            %
+            % Printed with plain fprintf, NOT GridLog: this is an explicit
+            % answer to "how long did that take", so it must appear whether
+            % or not Verbose Output is on -- same reasoning as
+            % GridCompareFittingMethods' table.
+            if elapsedSeconds >= 60
+                mins = floor(elapsedSeconds/60);
+                secs = elapsedSeconds - 60*mins;
+                durationText = sprintf('%dm %04.1fs (%.1f s)', mins, secs, elapsedSeconds);
+            else
+                durationText = sprintf('%.1f s', elapsedSeconds);
+            end
+            if wasCancelled
+                fprintf('[GridCorrection] %s CANCELLED after %s.\n', routineName, durationText);
+            else
+                fprintf('[GridCorrection] %s finished in %s (%d planes, %dx%d grid).\n', ...
+                    routineName, durationText, app.grid_SizeZ, app.grid_SizeX, app.grid_SizeY);
+            end
+        end
+
+        function tf = GridIsGenuineMeasurement(~, info)
+            % Is this point a real, converged measurement of the crossing --
+            % whichever estimator produced it?
+            %
+            % This used to be written inline as strcmp(info.source,'lattice')
+            % in GridFitZSmoothing and GridLatticeFromZHistory. That was fine
+            % while 'lattice' was the only label a converged point could
+            % carry, but V9's method 2 labels its converged points
+            % 'xcorr+fit' -- so those tests silently saw ZERO genuine
+            % measurements and switched the entire Z-correlation safety net
+            % off for method 2, which is exactly what let a slipped plane
+            % survive under method 2 while method 1 recovered.
+            %
+            % Genuine: 'lattice' (local fit alone) and 'xcorr+fit' (both
+            % estimators independently agreed).
+            % NOT genuine, deliberately: 'degenerate' (one bar direction
+            % missing), 'xcorr-unverified' (template match the local fit
+            % would not confirm), 'propagated' (carried from a neighbouring
+            % plane), 'lattice-raw' (unrefined preview placement).
+            tf = false;
+            if ~isstruct(info) || ~isfield(info,'source') || ~isfield(info,'fitOK')
+                return;
+            end
+            tf = info.fitOK && any(strcmp(info.source, {'lattice','xcorr+fit'}));
         end
 
         function GridUpdatePlaneTrust(app, plane)
@@ -3390,6 +4357,7 @@ classdef ImagePostProcessingDlgV8 < matlab.apps.AppBase
 
             fig = app.ImageCorrectionDialogUIFigure;
             dlg = uiprogressdlg(fig, 'Title', 'Refining All Planes', 'Cancelable','on');
+            routineTimer = tic;   % total wall-clock, reported at the end
 
             [FFGain, ffOK] = GridLoadFlatfieldGainMap(app);
 
@@ -3412,6 +4380,7 @@ classdef ImagePostProcessingDlgV8 < matlab.apps.AppBase
                 end
                 if dlg.CancelRequested
                     close(dlg);
+                    GridReportRoutineTime(app, 'Refine All Planes', toc(routineTimer), true);
                     GridChangeDisplayPlane(app);
                     return;
                 end
@@ -3438,7 +4407,10 @@ classdef ImagePostProcessingDlgV8 < matlab.apps.AppBase
                 end
             end
 
+            % Read the cancel flag BEFORE close() deletes the dialog.
+            wasCancelled = dlg.CancelRequested;
             close(dlg);
+            GridReportRoutineTime(app, 'Refine All Planes', toc(routineTimer), wasCancelled);
             GridChangeDisplayPlane(app); % refresh whichever plane is currently shown
         end
 
@@ -3857,22 +4829,59 @@ classdef ImagePostProcessingDlgV8 < matlab.apps.AppBase
                 if pass == 1
                     GridPopulatePlaneAuto(app, plane, latticeModel);
                 else
+                    % Only RE-fit the points that are not already converged.
+                    % A point whose local fit already succeeded is at a local
+                    % optimum of its own profile; re-running it from a seed a
+                    % fraction of a pixel away lands in the same place, so the
+                    % work is wasted -- and worse, it is not neutral: measured
+                    % on the 2026 stack, plane 8 went 86 -> 84 converged on
+                    % pass 2, i.e. re-fitting good points LOST two of them.
+                    % The later passes exist for the stragglers, so give them
+                    % the whole pass.
+                    retryIndices = [];
+                    for index = 1:nTotal
+                        infoIdx = app.grid_Info{index, plane};
+                        isGood = isstruct(infoIdx) && isfield(infoIdx,'fitOK') && infoIdx.fitOK ...
+                            && isfield(infoIdx,'status') && infoIdx.status==1;
+                        if ~isGood
+                            retryIndices(end+1) = index; %#ok<AGROW>
+                        end
+                    end
+                    if isempty(retryIndices)
+                        break;  % nothing left that a further pass could help
+                    end
                     refinedModel = GridLatticeFromSurface(app, plane);
-                    GridPopulatePlaneAuto(app, plane, refinedModel);
+                    GridLog(app, 'Plane %d: pass %d re-fitting %d unconverged point(s) only', ...
+                        plane, pass, numel(retryIndices));
+                    GridPopulatePlaneAuto(app, plane, refinedModel, retryIndices);
                 end
                 GridFitSmoothSurface(app, plane);
 
                 nGoodNow = 0;
+                nStructural = 0;
                 for index = 1:nTotal
                     infoIdx = app.grid_Info{index, plane};
                     if isstruct(infoIdx) && isfield(infoIdx,'status') && infoIdx.status==1 ...
                             && isfield(infoIdx,'fitOK') && infoIdx.fitOK
                         nGoodNow = nGoodNow + 1;
+                    elseif isstruct(infoIdx) && isfield(infoIdx,'structural') && infoIdx.structural
+                        nStructural = nStructural + 1;
                     end
                 end
                 GridLog(app, 'Plane %d: pass %d/%d -> %d/%d converged', plane, pass, maxPasses, nGoodNow, nTotal);
                 if nGoodNow <= prevGoodCount || nGoodNow >= nTotal*0.98
                     break; % no more improvement, or effectively fully converged
+                end
+                if nGoodNow + nStructural >= nTotal*0.98
+                    % Everything still outstanding failed for a STRUCTURAL
+                    % reason -- a bar direction missing from the image. No
+                    % amount of reseeding recovers those, and measured on the
+                    % 2024 stack the extra pass returned an identical count
+                    % every time (91->91, 90->90, 88->88). Stop instead of
+                    % paying a full pass to rediscover that.
+                    GridLog(app, ['Plane %d: %d point(s) unmeasurable (missing bar direction) -- ' ...
+                        'stopping at pass %d rather than re-running for no gain.'], plane, nStructural, pass);
+                    break;
                 end
                 prevGoodCount = nGoodNow;
             end
@@ -4034,6 +5043,27 @@ classdef ImagePostProcessingDlgV8 < matlab.apps.AppBase
             end
         end
 
+        function GridFocusMainWindow(app)
+            % Raise the main dialog back to the front.
+            %
+            % A native file picker (uigetfile/uiputfile) is a separate OS
+            % window, and when it closes Windows hands focus back to
+            % whichever MATLAB window it feels like -- typically the main
+            % MATLAB desktop, leaving this dialog buried behind it. Calling
+            % figure() on the uifigure re-raises it. Wrapped in try/catch
+            % because failing to raise a window must never break the action
+            % the user actually asked for.
+            try
+                fig = app.ImageCorrectionDialogUIFigure;
+                if isvalid(fig)
+                    figure(fig);
+                    drawnow;
+                end
+            catch
+                % non-fatal: the dialog is simply left where it was
+            end
+        end
+
         function GridCloseFigures(~)
             % Close every plain (non-uifigure) figure window this app may
             % have created -- fitting-debug plots (2), correction-test
@@ -4147,8 +5177,7 @@ classdef ImagePostProcessingDlgV8 < matlab.apps.AppBase
                     xVals(z) = app.grid_Position(index,1,z);
                     yVals(z) = app.grid_Position(index,2,z);
 
-                    isGenuineMeasurement = strcmp(info.source,'lattice') && ...
-                        isfield(info,'fitOK') && info.fitOK;
+                    isGenuineMeasurement = GridIsGenuineMeasurement(app, info);
                     isNotOutlier = ~isfield(info,'status') || info.status ~= 2;
                     trusted(z) = isGenuineMeasurement && isNotOutlier && ...
                         planeTrustedFlag(z) && planeQuality(z) >= 0.5;
@@ -4276,8 +5305,7 @@ classdef ImagePostProcessingDlgV8 < matlab.apps.AppBase
                         if ~isstruct(info) || ~isfield(info,'source')
                             continue;
                         end
-                        isGenuineMeasurement = strcmp(info.source,'lattice') && ...
-                            isfield(info,'fitOK') && info.fitOK;
+                        isGenuineMeasurement = GridIsGenuineMeasurement(app, info);
                         isNotOutlier = ~isfield(info,'status') || info.status ~= 2;
                         if isGenuineMeasurement && isNotOutlier && ...
                                 planeTrustedFlag(z) && planeQuality(z) >= 0.5
@@ -4402,6 +5430,7 @@ classdef ImagePostProcessingDlgV8 < matlab.apps.AppBase
                 defaultName = [baseName '_settings.mat'];
             end
             [filename,filepath]=uiputfile('*.mat','Save Current settings', defaultName);
+            GridFocusMainWindow(app); % native picker steals focus; raise the dialog back
             if filename == 0
                 return;
             end
@@ -4437,6 +5466,8 @@ classdef ImagePostProcessingDlgV8 < matlab.apps.AppBase
             Parameters.grid_AutoDetectEnabled=app.grid_AutoDetectEnabled;
             Parameters.optimizeGridCrossings=app.ui_OptimizeGrid;
             Parameters.grid_RefinementPasses=app.grid_RefinementPasses;
+            Parameters.grid_DetectionMethod=app.grid_DetectionMethod;
+            Parameters.grid_WidthRatio=app.grid_WidthRatio;
 
             save(filename, 'Parameters');
             GridMarkStateSaved(app);
@@ -4454,6 +5485,7 @@ classdef ImagePostProcessingDlgV8 < matlab.apps.AppBase
             % no visible error -- which is why "Load Settings" looked
             % like it simply didn't work.
             [filename,filepath]=uigetfile('*.mat','Load old settings');
+            GridFocusMainWindow(app); % native picker steals focus; raise the dialog back
             if filename == 0
                 return;
             end
@@ -4506,6 +5538,28 @@ classdef ImagePostProcessingDlgV8 < matlab.apps.AppBase
             else
                 app.grid_RefinementPasses=2;
             end
+            % Pre-V9 settings files carry neither of these. Default to
+            % method 1, matching the property default: a loaded file's stored
+            % POSITIONS are unaffected by this setting -- it only governs any
+            % re-detection from here on -- so the safe, proven path is right.
+            if isfield(Parameters,'grid_DetectionMethod')
+                app.grid_DetectionMethod=Parameters.grid_DetectionMethod;
+            else
+                app.grid_DetectionMethod=1;
+            end
+            if isfield(Parameters,'grid_WidthRatio')
+                app.grid_WidthRatio=Parameters.grid_WidthRatio;
+            else
+                app.grid_WidthRatio=[];
+            end
+            % Per-plane ratios are NOT persisted: they are cheap to
+            % re-measure and belong to a specific image, so restoring them
+            % alongside a possibly-different reference image would be worse
+            % than starting clean. The single grid_WidthRatio above survives
+            % as a sane starting reference.
+            app.grid_WidthRatioByPlane = [];
+            % Correlation peaks belong to the previous image/lattice.
+            app.GridXCorrCache = [];
           catch ME
                  app.filename_CurrentSettings='Invalid file!';
                  uialert(app.ImageCorrectionDialogUIFigure, ...
@@ -4576,6 +5630,7 @@ classdef ImagePostProcessingDlgV8 < matlab.apps.AppBase
                 return;
             end
             [ff_filename,ff_filepath]=uigetfile('*.tiff;*.tif','Choose a flatfield image');
+            GridFocusMainWindow(app); % native picker steals focus; raise the dialog back
             if ff_filename == 0
                 return;
             end
@@ -4593,6 +5648,7 @@ classdef ImagePostProcessingDlgV8 < matlab.apps.AppBase
             % gates other developer/testing conveniences elsewhere, e.g.
             % ConfirmGridReinit's dialog bypass -- just not this one).
             [filename,filepath]=uigetfile('*.tiff;*.tif','Choose a reference image');
+            GridFocusMainWindow(app); % native picker steals focus; raise the dialog back
             if filename == 0
                 return;
             end
@@ -4614,6 +5670,7 @@ classdef ImagePostProcessingDlgV8 < matlab.apps.AppBase
                 return;
             end
             [filename,filepath]=uigetfile('*.mat','Choose Lens Distortion Correction Reference');
+            GridFocusMainWindow(app); % native picker steals focus; raise the dialog back
             if filename == 0
                 return;
             end
@@ -5078,6 +6135,7 @@ classdef ImagePostProcessingDlgV8 < matlab.apps.AppBase
             fig=app.ImageCorrectionDialogUIFigure;
             title='Grid Optimization';
             dlg=uiprogressdlg(fig, 'Title', title, 'Cancelable','on');
+            routineTimer = tic;   % total wall-clock, reported at the end
 
             for i=2:app.grid_SizeZ
                 msg=sprintf('Working on Grid Plane %d / %d', i, app.grid_SizeZ);
@@ -5188,7 +6246,11 @@ classdef ImagePostProcessingDlgV8 < matlab.apps.AppBase
                 end
             end
 
+            % Read the cancel flag BEFORE closing the dialog -- the object is
+            % deleted by close() and the flag is unreadable afterwards.
+            wasCancelled = dlg.CancelRequested;
             close(dlg);
+            GridReportRoutineTime(app, 'Populate the Rest', toc(routineTimer), wasCancelled);
             % Return to plane 1 so the displayed count matches the still-
             % displayed figure (the figure isn't redrawn here), and refresh
             % it to show plane 1's final, fully-processed positions.
@@ -5383,6 +6445,7 @@ classdef ImagePostProcessingDlgV8 < matlab.apps.AppBase
                 'gridPlaneEnd', app.grid_PlaneStart+(app.grid_SizeZ-1)*app.grid_PlaneInterval, ...
                 'verboseOutput', app.ui_VerboseOutput, 'showFittingFigure', app.debugPlot, ...
                 'optimizeGrid', app.ui_OptimizeGrid, 'transformationMethod', app.ui_TransformationMethod, ...
+                'detectionMethod', app.grid_DetectionMethod, ...
                 'style', app.ui_Style, ...
                 'outputShiftX', app.image_OutputShiftX, 'outputShiftY', app.image_OutputShiftY, ...
                 'gridFieldsEnabled', app.ui_GridFieldsEnabled, 'quickSetupEnabled', app.ui_QuickSetupEnabled, ...
@@ -5438,6 +6501,12 @@ classdef ImagePostProcessingDlgV8 < matlab.apps.AppBase
                     ShowFittingFigureCheckBoxValueChanged(app, struct('Value', data.value));
                 case 'setOptimizeGrid'
                     app.ui_OptimizeGrid = data.value;
+                case 'setDetectionMethod'
+                    % Changing how crossings are found invalidates any
+                    % cached correlation peaks and the harvested width
+                    % ratio, both of which belong to the previous choice.
+                    app.grid_DetectionMethod = data.value;
+                    app.GridXCorrCache = [];
                 case 'setTransformationMethod'
                     app.ui_TransformationMethod = data.value;
                 case 'setStyle'
@@ -5583,7 +6652,8 @@ classdef ImagePostProcessingDlgV8 < matlab.apps.AppBase
                 app.filename_GridRef, app.filename_Flatfield, app.filename_GeometricDistortion, ...
                 app.ui_ApplyFF, app.ui_ApplyGC, app.ui_ApplyDC, ...
                 app.image_OutputShiftX, app.image_OutputShiftY, ...
-                app.grid_AutoDetectEnabled, app.ui_OptimizeGrid, app.grid_RefinementPasses};
+                app.grid_AutoDetectEnabled, app.ui_OptimizeGrid, app.grid_RefinementPasses, ...
+                app.grid_DetectionMethod};
         end
 
         function GridMarkStateSaved(app)
@@ -5905,6 +6975,14 @@ classdef ImagePostProcessingDlgV8 < matlab.apps.AppBase
                 '      </div>'
                 '      <div class="divider"></div>'
                 '      <div class="field-grid">'
+                '        <label>Grid point detection<span class="hint">how each crossing is located</span></label>'
+                '        <select id="detectionMethod" onchange="sendAction(''setDetectionMethod'', Number(this.value))">'
+                '          <option value="1">local fit only (default)</option>'
+                '          <option value="2">cross-correlation + local fit</option>'
+                '        </select>'
+                '      </div>'
+                '      <div class="divider"></div>'
+                '      <div class="field-grid">'
                 '        <label>Transformation method</label>'
                 '        <select id="transformationMethod" onchange="sendAction(''setTransformationMethod'', this.value)">'
                 '          <option value="1">affine</option>'
@@ -6044,6 +7122,7 @@ classdef ImagePostProcessingDlgV8 < matlab.apps.AppBase
                 '    document.getElementById("optimizeGrid").checked = !!model.optimizeGrid;'
                 '    document.getElementById("showFittingFigure").checked = !!model.showFittingFigure;'
                 '    document.getElementById("transformationMethod").value = model.transformationMethod;'
+                '    document.getElementById("detectionMethod").value = model.detectionMethod;'
                 '    setIfNotFocused(document.getElementById("outputShiftX"), model.outputShiftX);'
                 '    setIfNotFocused(document.getElementById("outputShiftY"), model.outputShiftY);'
                 ''
@@ -6376,7 +7455,7 @@ classdef ImagePostProcessingDlgV8 < matlab.apps.AppBase
     methods (Access = public)
 
         % Construct app
-        function app = ImagePostProcessingDlgV8(varargin)
+        function app = ImagePostProcessingDlgV09(varargin)
 
             % Create UIFigure and components
             createComponents(app)
@@ -6398,6 +7477,22 @@ classdef ImagePostProcessingDlgV8 < matlab.apps.AppBase
             % visualization scripts (e.g. plotting GridLastCompareResults
             % over the real image) need pixel data to overlay onto.
             img = app.grid_PlaneImgBuf(:,:,plane);
+        end
+
+        function GridTestPopulatePlaneWithModel(app, plane, latticeModel)
+            % TEST HARNESS ONLY -- populates a plane from a caller-supplied
+            % lattice model, i.e. GridPopulatePlaneAuto with a seed the
+            % caller controls.
+            %
+            % Exists so a test can reproduce the seed conditions the real
+            % pipeline creates but the UI cannot: in particular handing
+            % plane N the PREVIOUS plane's lattice model, which is what
+            % Populate-the-Rest's Z-trend seeding effectively does and which
+            % is how a whole-cell slip gets in. Driving this through
+            % "Optimize This Plane" instead is not equivalent -- that always
+            % re-seeds from the plane's own current (already good) positions,
+            % which silently hides the failure.
+            GridPopulatePlaneAuto(app, plane, latticeModel);
         end
 
         function [posOut, statusOut, rmseOut] = GridTestRunBaselineOnImage(app, testImage, seedXY, dx1, dy1)
