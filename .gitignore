@@ -1,0 +1,57 @@
+# Autosave files
+*.asv
+*.m~
+*.autosave
+*.slx.r*
+*.mdl.r*
+
+# Derived content-obscured files
+*.p
+
+# Compiled MEX files
+*.mex*
+
+# Packaged app and toolbox files
+*.mlappinstall
+*.mltbx
+
+# Deployable archives
+*.ctf
+
+# Generated helpsearch folders
+helpsearch*/
+
+# Code generation folders
+slprj/
+sccprj/
+codegen/
+
+# Cache files
+*.slxc
+
+# Cloud based storage dotfile
+.MATLABDriveTag
+
+# buildtool cache folder
+.buildtool/
+
+# SimBiology backup files
+*.sbproj.backup
+*.sbproj.bak
+
+# Microscope data
+*.tiff
+*.tif
+*.jpg
+
+# Working settings and saved measurements
+*.mat
+
+# Local Claude Code settings
+.claude/settings.local.json
+
+# Superseded intermediate versions (V1 and V6-V11 are kept)
+ImagePostProcessingDlgV2.mlapp
+ImagePostProcessingDlgV3.mlapp
+ImagePostProcessingDlgV4.mlapp
+ImagePostProcessingDlgV5.mlapp
