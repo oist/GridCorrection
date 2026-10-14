@@ -47,11 +47,16 @@ classdef ImagePostProcessingDlgV11 < matlab.apps.AppBase
         % that had no such shadow property because they were always read
         % straight from a live uicontrol.Value)
         ui_VerboseOutput = true;
-        ui_OptimizeGrid = true;
+        ui_OptimizeGrid = true;                  %ALWAYS ON. Was a "Optimize Grid Crossings (fit + smooth)"
+                                                 %checkbox; removed from the UI 2026-10-14 at the user's
+                                                 %instruction. Unchecking it placed raw lattice positions
+                                                 %with no fitting at all -- a preview, not a result -- and
+                                                 %there is no reason to ship that as a user choice. Kept
+                                                 %as a property so the branches that read it still work.
         ui_ApplyFF = false;
         ui_ApplyGC = false;
         ui_ApplyDC = false;
-        ui_TransformationMethod = '1';
+        ui_TransformationMethod = '3';           %'3' = polynomial order 3, the default since 2026-10-14.
         ui_Style = 'STV 0, All Points';
 
         % Enable/disable flags for the Grid setup page, formerly expressed
@@ -135,7 +140,8 @@ classdef ImagePostProcessingDlgV11 < matlab.apps.AppBase
                                                  %(whether to optimize at all is controlled by the
                                                  %OptimizeGridCheckBox UI control, not a private property,
                                                  %matching the ApplyFFCheckBox/ApplyGCCheckBox convention)
-        grid_DetectionMethod = 1;               %how each crossing's position is found.
+        grid_DetectionMethod = 3;               %how each crossing's position is found. DEFAULT 3 since
+                                                 %2026-10-14: local fit + joint 3D fill across planes.
                                                  %
                                                  %ONLY 1 AND 3 ARE SELECTABLE. Methods 2 and 4 were
                                                  %withdrawn 2026-09-29 at the user's instruction; both
@@ -7088,6 +7094,11 @@ classdef ImagePostProcessingDlgV11 < matlab.apps.AppBase
             % size fields editable, Quick Setup disabled until a
             % reference image is chosen) and pushes the first view model
             % so the HTML page reflects real app state as soon as it loads.
+            % Bring back whatever the dialog was last set to, BEFORE the
+            % first view model is pushed, so the page renders the remembered
+            % setup rather than flashing the factory one first.
+            GridLoadUserDefaults(app);
+
             GridSettingStatusChange(app, 0);
             GridMarkStateSaved(app); % a blank app has nothing unsaved yet
         end
@@ -7138,7 +7149,6 @@ classdef ImagePostProcessingDlgV11 < matlab.apps.AppBase
 
             Parameters.grid_LatticeModel=app.grid_LatticeModel;
             Parameters.grid_AutoDetectEnabled=app.grid_AutoDetectEnabled;
-            Parameters.optimizeGridCrossings=app.ui_OptimizeGrid;
             Parameters.grid_RefinementPasses=app.grid_RefinementPasses;
             Parameters.grid_DetectionMethod=app.grid_DetectionMethod;
             % Neither grid_AnchorEnabled nor grid_AnchorSubsample is saved --
@@ -7205,11 +7215,11 @@ classdef ImagePostProcessingDlgV11 < matlab.apps.AppBase
             else
                 app.grid_AutoDetectEnabled=true;
             end
-            if isfield(Parameters,'optimizeGridCrossings')
-                app.ui_OptimizeGrid=Parameters.optimizeGridCrossings;
-            else
-                app.ui_OptimizeGrid=true;
-            end
+            % optimizeGridCrossings in an older settings file is IGNORED:
+            % it is no longer a user choice, and a file saved with it off
+            % would otherwise silently disable all fitting with no UI left
+            % to turn it back on.
+            app.ui_OptimizeGrid=true;
             if isfield(Parameters,'grid_RefinementPasses')
                 app.grid_RefinementPasses=Parameters.grid_RefinementPasses;
             else
@@ -7302,6 +7312,7 @@ classdef ImagePostProcessingDlgV11 < matlab.apps.AppBase
                 app.parentApp.ImagePostProcessing.Enable = 'on';
             end
 
+            GridSaveUserDefaults(app);
             GridCloseFigures(app);
             delete(app);
         end
@@ -8130,6 +8141,126 @@ classdef ImagePostProcessingDlgV11 < matlab.apps.AppBase
         end
 
         % Button pushed function: ResetSettingsButton
+        % ---- REMEMBERED SETUP, AND THE WAY BACK TO FACTORY ----------------
+        %
+        % The setup dialog remembers what it was last set to, so reopening the
+        % app does not mean re-typing the grid size, the plane range and the
+        % method every time. Stored per user via setpref, NOT in the project
+        % folder: it is a preference, not a result, and it must not turn up as
+        % a modified file in the repo or get copied around with the code.
+        %
+        % Only the SETUP fields are remembered -- never measured positions,
+        % lattice models or anything else a settings .mat carries. Those
+        % belong to a particular image and remembering them across sessions
+        % would be actively wrong.
+
+        function names = GridRememberedFields(~)
+            % The single list the save, the restore and the factory reset all
+            % work from, so they cannot drift apart.
+            names = { ...
+                'grid_SizeX', 'grid_SizeY', 'grid_SizeZ', ...
+                'grid_PlaneStart', 'grid_PlaneInterval', 'grid_PlaneAveraging', ...
+                'grid_DetectionMethod', 'grid_RefinementPasses', 'grid_AutoDetectEnabled', ...
+                'ui_TransformationMethod', 'ui_VerboseOutput', 'debugPlot', ...
+                'ui_ApplyFF', 'ui_ApplyGC', 'ui_ApplyDC', ...
+                'image_OutputShiftX', 'image_OutputShiftY'};
+        end
+
+        function GridSaveUserDefaults(app)
+            % Remember the current setup for next time. Called from the close
+            % request, so a scripted delete(app) -- which does not go through
+            % it -- cannot overwrite a real user's remembered setup.
+            try
+                remembered = struct();
+                names = GridRememberedFields(app);
+                for k = 1:numel(names)
+                    remembered.(names{k}) = app.(names{k});
+                end
+                % File paths are remembered too, but checked on the way back
+                % in: a path that no longer resolves is worse than none.
+                remembered.filename_Flatfield = app.filename_Flatfield;
+                remembered.filename_GridRef = app.filename_GridRef;
+                remembered.filename_GeometricDistortion = app.filename_GeometricDistortion;
+                setpref('ImagePostProcessingDlg', 'userDefaults', remembered);
+            catch ME
+                % Never let a preferences problem stop the app closing.
+                GridLog(app, 'Could not remember the current setup (%s).', ME.message);
+            end
+        end
+
+        function GridLoadUserDefaults(app)
+            % Restore what was last used, field by field, skipping anything
+            % that is missing or the wrong type -- a preferences store written
+            % by an older build must not be able to break startup.
+            if ~ispref('ImagePostProcessingDlg', 'userDefaults')
+                return;
+            end
+            try
+                remembered = getpref('ImagePostProcessingDlg', 'userDefaults');
+            catch
+                return;
+            end
+            if ~isstruct(remembered)
+                return;
+            end
+            names = GridRememberedFields(app);
+            for k = 1:numel(names)
+                nm = names{k};
+                if ~isfield(remembered, nm)
+                    continue;
+                end
+                value = remembered.(nm);
+                if isempty(value) || ~strcmp(class(value), class(app.(nm)))
+                    continue;
+                end
+                app.(nm) = value;
+            end
+            % A remembered detection method that has since been withdrawn
+            % must still land on something valid.
+            app.grid_DetectionMethod = GridResolveDetectionMethod(app, app.grid_DetectionMethod);
+
+            % Paths only if they still resolve.
+            for nm = {'filename_Flatfield','filename_GridRef','filename_GeometricDistortion'}
+                f = nm{1};
+                if isfield(remembered, f) && ischar(remembered.(f)) && ~isempty(remembered.(f)) ...
+                        && ~strcmp(remembered.(f),'none') && isfile(remembered.(f))
+                    app.(f) = remembered.(f);
+                end
+            end
+        end
+
+        function GridRestoreFactoryDefaults(app)
+            % Put every remembered field back to this class's own default and
+            % forget the stored preference, so the next start is factory too.
+            %
+            % Reads the defaults off a FRESH metaclass description rather than
+            % hard-coding them here: a second copy of the default values would
+            % be one more thing to keep in step with the property block.
+            mc = metaclass(app);
+            props = mc.PropertyList;
+            names = GridRememberedFields(app);
+            nRestored = 0;
+            for k = 1:numel(names)
+                idx = find(strcmp({props.Name}, names{k}), 1);
+                if isempty(idx) || ~props(idx).HasDefault
+                    continue;
+                end
+                app.(names{k}) = props(idx).DefaultValue;
+                nRestored = nRestored + 1;
+            end
+            app.filename_Flatfield = 'none';
+            app.filename_GridRef = 'none';
+            app.filename_GeometricDistortion = 'none';
+            if ispref('ImagePostProcessingDlg', 'userDefaults')
+                rmpref('ImagePostProcessingDlg', 'userDefaults');
+            end
+            GridSettingStatusChange(app, 0);
+            GridMarkStateSaved(app);
+            GridLog(app, ['Restored %d setting(s) to their defaults and cleared the remembered setup. ' ...
+                'Detection method %d, transformation method %s.'], ...
+                nRestored, app.grid_DetectionMethod, app.ui_TransformationMethod);
+        end
+
         function ResetSettingsButtonPushed(app, event)
             GridSettingStatusChange(app, 0);
             % Back to a blank state: there is nothing left worth saving,
@@ -8223,7 +8354,7 @@ classdef ImagePostProcessingDlgV11 < matlab.apps.AppBase
                 'gridPlaneInterval', app.grid_PlaneInterval, ...
                 'gridPlaneEnd', app.grid_PlaneStart+(app.grid_SizeZ-1)*app.grid_PlaneInterval, ...
                 'verboseOutput', app.ui_VerboseOutput, 'showFittingFigure', app.debugPlot, ...
-                'optimizeGrid', app.ui_OptimizeGrid, 'transformationMethod', app.ui_TransformationMethod, ...
+                'transformationMethod', app.ui_TransformationMethod, ...
                 'detectionMethod', app.grid_DetectionMethod, ...
                 'style', app.ui_Style, ...
                 'outputShiftX', app.image_OutputShiftX, 'outputShiftY', app.image_OutputShiftY, ...
@@ -8286,8 +8417,6 @@ classdef ImagePostProcessingDlgV11 < matlab.apps.AppBase
                     app.ui_VerboseOutput = data.value;
                 case 'setShowFittingFigure'
                     ShowFittingFigureCheckBoxValueChanged(app, struct('Value', data.value));
-                case 'setOptimizeGrid'
-                    app.ui_OptimizeGrid = data.value;
                 case 'setDetectionMethod'
                     % Changing how crossings are found invalidates any
                     % cached correlation peaks and the harvested width
@@ -8322,6 +8451,8 @@ classdef ImagePostProcessingDlgV11 < matlab.apps.AppBase
                     if app.ui_ViewEditorEnabled
                         GridChangeDisplayPlane(app);
                     end
+                case 'restoreDefaults'
+                    GridRestoreFactoryDefaults(app);
                 case 'resetSettings'
                     ResetSettingsButtonPushed(app, []);
                 case 'loadSettings'
@@ -8500,7 +8631,7 @@ classdef ImagePostProcessingDlgV11 < matlab.apps.AppBase
                 app.filename_GridRef, app.filename_Flatfield, app.filename_GeometricDistortion, ...
                 app.ui_ApplyFF, app.ui_ApplyGC, app.ui_ApplyDC, ...
                 app.image_OutputShiftX, app.image_OutputShiftY, ...
-                app.grid_AutoDetectEnabled, app.ui_OptimizeGrid, app.grid_RefinementPasses, ...
+                app.grid_AutoDetectEnabled, app.grid_RefinementPasses, ...
                 app.grid_DetectionMethod};
         end
 
@@ -8814,10 +8945,6 @@ classdef ImagePostProcessingDlgV11 < matlab.apps.AppBase
                 '        <label for="verboseOutput">Verbose Output</label>'
                 '      </div>'
                 '      <div class="checkbox-row">'
-                '        <input type="checkbox" id="optimizeGrid" onchange="sendAction(''setOptimizeGrid'', this.checked)">'
-                '        <label for="optimizeGrid">Optimize Grid Crossings (fit + smooth)</label>'
-                '      </div>'
-                '      <div class="checkbox-row">'
                 '        <input type="checkbox" id="showFittingFigure" onchange="sendAction(''setShowFittingFigure'', this.checked)">'
                 '        <label for="showFittingFigure">Show Fitting Figure</label>'
                 '      </div>'
@@ -8825,17 +8952,19 @@ classdef ImagePostProcessingDlgV11 < matlab.apps.AppBase
                 '      <div class="field-grid">'
                 '        <label>Grid point detection<span class="hint">how each crossing is located</span></label>'
                 '        <select id="detectionMethod" onchange="sendAction(''setDetectionMethod'', Number(this.value))">'
-                '          <option value="1">local fit only (default)</option>'
-                '          <option value="3">local fit + joint 3D fill across planes</option>'
+                '          <option value="1">local fit only</option>'
+                '          <option value="3">local fit + joint 3D fill across planes (default)</option>'
                 '        </select>'
                 '      </div>'
+                '      <div class="divider"></div>'
+                '      <button class="btn secondary" id="btnRestoreDefaults" onclick="sendAction(''restoreDefaults'')">Restore Default Settings</button>'
                 '      <div class="divider"></div>'
                 '      <div class="field-grid">'
                 '        <label>Transformation method</label>'
                 '        <select id="transformationMethod" onchange="sendAction(''setTransformationMethod'', this.value)">'
                 '          <option value="1">affine</option>'
                 '          <option value="2">projective</option>'
-                '          <option value="3">polynomial (order 3)</option>'
+                '          <option value="3">polynomial (order 3) (default)</option>'
                 '          <option value="4">polynomial (order 4)</option>'
                 '          <option value="5">piecewise-affine</option>'
                 '          <option value="6">piecewise-projective</option>'
@@ -8974,7 +9103,6 @@ classdef ImagePostProcessingDlgV11 < matlab.apps.AppBase
                 '    setIfNotFocused(document.getElementById("gridPlaneEnd"), model.gridPlaneEnd);'
                 ''
                 '    document.getElementById("verboseOutput").checked = !!model.verboseOutput;'
-                '    document.getElementById("optimizeGrid").checked = !!model.optimizeGrid;'
                 '    document.getElementById("showFittingFigure").checked = !!model.showFittingFigure;'
                 '    document.getElementById("transformationMethod").value = model.transformationMethod;'
                 '    document.getElementById("detectionMethod").value = model.detectionMethod;'
@@ -9450,6 +9578,23 @@ classdef ImagePostProcessingDlgV11 < matlab.apps.AppBase
         function tf = GridTestIsGenuine(app, index, plane)
             % TEST HARNESS ONLY -- the genuine-measurement predicate.
             tf = GridIsGenuineMeasurement(app, app.grid_Info{index, plane});
+        end
+
+        function GridTestRefinePlaneFromCurrent(app, plane)
+            % TEST HARNESS ONLY -- exactly what the post-population stage
+            % does to ONE plane: re-seed from where the points currently
+            % stand and run the thorough refinement. Lets a test measure how
+            % far that stage actually moves anything.
+            app.grid_PlaneCurrent = plane;
+            ChangeRefImagePlane(app);
+            seedModel = GridLatticeFromCurrentPositions(app, plane);
+            GridOptimizePlaneUntilConverged(app, plane, seedModel, max(app.grid_RefinementPasses,4));
+            GridUpdatePlaneTrust(app, plane);
+        end
+
+        function GridTestZSmooth(app)
+            % TEST HARNESS ONLY -- the cross-plane Z correlation stage.
+            GridFitZSmoothing(app);
         end
 
         function GridTestSetPeriodSurvey(app, tf)
