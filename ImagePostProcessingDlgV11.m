@@ -1,4 +1,7 @@
-%IMAGEPOSTPROCESSINGDLGV11  TEM grid distortion correction -- CURRENT VERSION.
+%IMAGEPOSTPROCESSINGDLGV11  Geometric distortion correction -- CURRENT VERSION.
+%
+%   Measures and corrects geometric distortion in momentum microscope and
+%   TEM images, using the shadow of a regular TEM grid as the reference.
 %
 %   The latest and most up-to-date version. This is the one to run.
 %   See README.md for what it does and how it got here.
