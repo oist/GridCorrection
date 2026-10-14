@@ -1,12 +1,20 @@
-# TEM Grid Distortion Correction
+# Grid Distortion Correction
 
 A MATLAB App Designer application for measuring and correcting geometric distortion in
-transmission electron microscope images, using the shadow of a regular TEM grid as a
-reference.
+**momentum microscope** and **transmission electron microscope (TEM)** images.
+
+It uses the shadow of a regular TEM grid — a copper mesh of known, uniform pitch — as the
+distortion reference. Because the true geometry of the mesh is known, any departure of its
+imaged shadow from a perfect lattice is instrument distortion, and can be measured and
+inverted.
 
 The app locates every grid crossing across a Z-stack of grid-shadow images, fits a
 distortion model to the measured positions, and applies that correction to experimental
 images.
+
+Distortion is not constant through a stack: it varies with energy and focus, so each plane
+is measured on its own and the variation across planes is modelled rather than assumed
+away.
 
 **`ImagePostProcessingDlgV11.m` is the current version.** Earlier versions are kept in the
 repository as frozen snapshots; none of them is loaded or called by V11.

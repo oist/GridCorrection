@@ -1,4 +1,7 @@
-%IMAGEPOSTPROCESSINGDLGV08  TEM grid distortion correction -- OLDER VERSION.
+%IMAGEPOSTPROCESSINGDLGV08  Geometric distortion correction -- OLDER VERSION.
+%
+%   Measures and corrects geometric distortion in momentum microscope and
+%   TEM images, using the shadow of a regular TEM grid as the reference.
 %
 %   Superseded, kept as a frozen snapshot of how the app worked at the time.
 %   The current version is ImagePostProcessingDlgV11. See README.md.
