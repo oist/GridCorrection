@@ -1,3 +1,8 @@
+%IMAGEPOSTPROCESSINGDLGV11  TEM grid distortion correction -- CURRENT VERSION.
+%
+%   The latest and most up-to-date version. This is the one to run.
+%   See README.md for what it does and how it got here.
+%
 classdef ImagePostProcessingDlgV11 < matlab.apps.AppBase
 
     % Properties that correspond to app components
