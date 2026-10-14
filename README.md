@@ -226,14 +226,16 @@ Position spacing agrees with each plane's own measured period to 0.02–0.45 px.
 ## Repository layout
 
 ```
-ImagePostProcessingDlgV11.m     current version
-ImagePostProcessingDlgV10.m     frozen snapshots, kept for reference
+ImagePostProcessingDlgV11.m       current version -- this is the one to run
+ImagePostProcessingDlgV10.m       recent versions, kept for reference
 ImagePostProcessingDlgV09.m
 ImagePostProcessingDlgV08.m
-ImagePostProcessingDlgV07.m
-ImagePostProcessingDlgV06.m
-ImagePostProcessingDlgV01.mlapp the original App Designer version
-GridCorrection.prj              MATLAB project file
+archive/                          versions older than V08
+  ImagePostProcessingDlgV07.m
+  ImagePostProcessingDlgV06.m
+  ImagePostProcessingDlgV01.mlapp the original App Designer version
+GridCorrection.prj                MATLAB project file
+README.md
 ```
 
 Each version is a self-contained `classdef`; none references another. Versions are branched
